@@ -1,0 +1,292 @@
+---
+# =====================================================================
+#  Despliegue de k3s (standalone, SIN CNI) + Cilium en Raspberry Pi
+# ---------------------------------------------------------------------
+#  Reproduce tu instalacion manual, pero:
+#    - Anade kube-proxy replacement (requerido por las L2 announcements)
+#    - Consolida install + hubble + upgrade en un unico values de Cilium
+#    - Es idempotente y hace las comprobaciones en cada fase
+#
+#  Uso:   ansible-playbook -i inventory.ini k3s-cilium-rpi.yml
+#  (Ojo: la primera ejecucion puede reiniciar la Pi para aplicar cgroups)
+# =====================================================================
+- name: k3s + Cilium en Raspberry Pi
+  hosts: k3s
+  become: true
+  gather_facts: true
+
+  vars:
+    # --- Red / nodo ---------------------------------------------------
+    # Por defecto coge la IP de la interfaz con ruta por defecto (eth0,
+    # con el wifi apagado). Sobreescribe si hace falta.
+    k3s_node_ip: "{{ ansible_default_ipv4.address }}"
+
+    # --- Versiones ----------------------------------------------------
+    cilium_version: "1.19.5"
+
+    # --- Opciones de Cilium ------------------------------------------
+    kube_proxy_replacement: true          # requerido por l2announcements
+    enable_l2_announcements: true
+    enable_hubble_ui: true
+
+    # --- LoadBalancer bare-metal (opcional) --------------------------
+    configure_lb: false
+    lb_ip_start: "192.168.0.241"          # IPs LIBRES de tu LAN,
+    lb_ip_stop: "192.168.0.251"           # fuera del rango DHCP
+    lb_interface_regex: "^eth[0-9]+$"     # anuncia por Ethernet
+
+    # --- Rutas --------------------------------------------------------
+    boot_cmdline: /boot/firmware/cmdline.txt
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+
+  tasks:
+    # ============ 1. Comprobaciones previas ==========================
+    - name: Comprobar que la arquitectura es arm64 (aarch64)
+      ansible.builtin.assert:
+        that: ansible_architecture == "aarch64"
+        fail_msg: "Este playbook es para Raspberry Pi arm64."
+
+    - name: Asegurar cgroup_enable=memory en cmdline.txt (una sola linea)
+      ansible.builtin.replace:
+        path: "{{ boot_cmdline }}"
+        regexp: '^(?!.*\bcgroup_enable=memory\b)(.*)$'
+        replace: '\1 cgroup_enable=memory'
+      register: cmdline_change
+
+    - name: Reiniciar la Pi si se toco cmdline (aplicar cgroups antes de k3s)
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: cmdline_change.changed
+
+    - name: Leer controladores cgroup v2 activos
+      ansible.builtin.command: cat /sys/fs/cgroup/cgroup.controllers
+      register: cgroup_ctrl
+      changed_when: false
+
+    - name: Verificar que el controlador 'memory' esta activo (API v2, no /proc/cgroups)
+      ansible.builtin.assert:
+        that: "'memory' in cgroup_ctrl.stdout.split()"
+        fail_msg: >-
+          cgroup 'memory' inactivo. Revisa cgroup_enable=memory en {{ boot_cmdline }}
+          y que la Pi haya reiniciado.
+        success_msg: "cgroup de memoria activo."
+
+    # ============ 2. Instalar k3s SIN CNI ============================
+    - name: Crear /etc/rancher/k3s
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Escribir config declarativa de k3s
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0644"
+        content: |
+          write-kubeconfig-mode: "0644"
+          node-ip: "{{ k3s_node_ip }}"
+          flannel-backend: none
+          disable-network-policy: true
+          disable:
+            - traefik
+            - servicelb
+          {% if kube_proxy_replacement %}
+          disable-kube-proxy: true
+          egress-selector-mode: cluster
+          {% endif %}
+      notify: restart k3s
+
+    - name: Instalar k3s (server, sin CNI)
+      ansible.builtin.shell: curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Asegurar k3s activo y habilitado al arranque
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+
+    - name: Aplicar cambios de config de k3s si los hubo
+      ansible.builtin.meta: flush_handlers
+
+    - name: Esperar a que el nodo se registre (NotReady sin CNI es normal)
+      ansible.builtin.command: k3s kubectl get nodes --no-headers
+      register: nodes_out
+      changed_when: false
+      retries: 20
+      delay: 6
+      until: nodes_out.rc == 0 and (nodes_out.stdout | length) > 0
+
+    # ============ 3. kubeconfig para el usuario ======================
+    - name: Crear ~/.kube del usuario
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+
+    - name: Copiar kubeconfig al home del usuario
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0600"
+
+    - name: Exportar KUBECONFIG en el .bashrc
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: "export KUBECONFIG=~/.kube/config"
+        state: present
+
+    # ============ 4. Instalar el CLI de Cilium (arm64) ===============
+    - name: Comprobar si el CLI de cilium ya esta
+      ansible.builtin.stat:
+        path: /usr/local/bin/cilium
+      register: cilium_cli
+
+    - name: Instalar el CLI de Cilium (con verificacion de checksum)
+      when: not cilium_cli.stat.exists
+      block:
+        - name: Obtener version estable del cilium-cli
+          ansible.builtin.command: curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt
+          register: cli_ver
+          changed_when: false
+
+        - name: Descargar cilium-cli y su checksum
+          ansible.builtin.get_url:
+            url: "https://github.com/cilium/cilium-cli/releases/download/{{ cli_ver.stdout }}/cilium-linux-arm64.tar.gz{{ item }}"
+            dest: "/tmp/cilium-linux-arm64.tar.gz{{ item }}"
+            mode: "0644"
+          loop: ["", ".sha256sum"]
+
+        - name: Verificar el checksum
+          ansible.builtin.command: sha256sum --check cilium-linux-arm64.tar.gz.sha256sum
+          args:
+            chdir: /tmp
+          changed_when: false
+
+        - name: Extraer cilium a /usr/local/bin
+          ansible.builtin.unarchive:
+            src: /tmp/cilium-linux-arm64.tar.gz
+            dest: /usr/local/bin
+            remote_src: true
+
+    # ============ 5. Instalar Cilium (CNI) ===========================
+    - name: Escribir values de Cilium
+      ansible.builtin.copy:
+        dest: /tmp/cilium-values.yaml
+        mode: "0644"
+        content: |
+          operator:
+            replicas: 1
+          ipam:
+            mode: cluster-pool
+            operator:
+              clusterPoolIPv4PodCIDRList:
+                - "10.42.0.0/16"
+          {% if kube_proxy_replacement %}
+          kubeProxyReplacement: true
+          k8sServiceHost: "{{ k3s_node_ip }}"
+          k8sServicePort: 6443
+          {% endif %}
+          {% if enable_l2_announcements %}
+          l2announcements:
+            enabled: true
+          externalIPs:
+            enabled: true
+          k8sClientRateLimit:
+            qps: 50
+            burst: 200
+          {% endif %}
+          {% if enable_hubble_ui %}
+          hubble:
+            relay:
+              enabled: true
+            ui:
+              enabled: true
+          {% endif %}
+
+    - name: Comprobar si Cilium ya esta instalado
+      ansible.builtin.command: k3s kubectl -n kube-system get daemonset cilium
+      register: cilium_ds
+      changed_when: false
+      failed_when: false
+
+    - name: Instalar Cilium
+      ansible.builtin.command: >-
+        cilium install --version {{ cilium_version }} -f /tmp/cilium-values.yaml
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      when: cilium_ds.rc != 0
+
+    - name: Esperar a que Cilium este operativo
+      ansible.builtin.command: cilium status --wait
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: cil_status
+      changed_when: false
+      retries: 3
+      delay: 15
+      until: cil_status.rc == 0
+
+    - name: Esperar a que el nodo pase a Ready (ya con CNI)
+      ansible.builtin.command: k3s kubectl get nodes --no-headers
+      register: node_ready
+      changed_when: false
+      retries: 20
+      delay: 6
+      until: node_ready.stdout is search('\sReady\s')
+
+    # ============ 6. (Opcional) LoadBalancer: IP pool + L2 ===========
+    - name: Configurar LoadBalancer bare-metal (pool de IPs + anuncio L2)
+      when: configure_lb | bool
+      block:
+        - name: Escribir manifiestos de LoadBalancer
+          ansible.builtin.copy:
+            dest: /tmp/cilium-lb.yaml
+            mode: "0644"
+            content: |
+              apiVersion: "cilium.io/v2"
+              kind: CiliumLoadBalancerIPPool
+              metadata:
+                name: pool-lan
+              spec:
+                blocks:
+                  - start: "{{ lb_ip_start }}"
+                    stop: "{{ lb_ip_stop }}"
+              ---
+              apiVersion: "cilium.io/v2alpha1"
+              kind: CiliumL2AnnouncementPolicy
+              metadata:
+                name: politica-l2
+              spec:
+                interfaces:
+                  - "{{ lb_interface_regex }}"
+                externalIPs: true
+                loadBalancerIPs: true
+
+        - name: Aplicar manifiestos de LoadBalancer
+          ansible.builtin.command: k3s kubectl apply -f /tmp/cilium-lb.yaml
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          register: lb_apply
+          changed_when: "'created' in lb_apply.stdout or 'configured' in lb_apply.stdout"
+
+    # ============ 7. Resumen final ===================================
+    - name: Recoger estado final del nodo
+      ansible.builtin.command: k3s kubectl get nodes -o wide
+      register: final_nodes
+      changed_when: false
+
+    - name: Mostrar resumen
+      ansible.builtin.debug:
+        msg: "{{ final_nodes.stdout_lines }}"
