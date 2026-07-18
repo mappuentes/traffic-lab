@@ -1,0 +1,113 @@
+---
+# =====================================================================
+#  Bootstrap de FluxCD (GitOps) sobre el clúster k3s de la Raspberry Pi
+# ---------------------------------------------------------------------
+#  Solo hace el bootstrap (instalar Flux + apuntarlo al repo). El
+#  CONTENIDO del repo (manifiestos del LB, apps, monitoring) lo gestiona
+#  Flux, no Ansible.
+#
+#  El token NO se guarda en el playbook: se lee de variables de entorno
+#  del nodo de control (donde lanzas ansible-playbook).
+#
+#  Uso:
+#    export GITHUB_USER=<tu-usuario>
+#    export GITHUB_TOKEN=<tu-token>
+#    ansible-playbook -i inventory.ini flux-bootstrap-rpi.yml --ask-become-pass
+#
+#  Es idempotente: puedes relanzarlo aunque Flux ya esté desplegado.
+# =====================================================================
+- name: Bootstrap de FluxCD en k3s
+  hosts: k3s
+  become: true
+  gather_facts: false
+
+  vars:
+    github_owner: "{{ lookup('env', 'GITHUB_USER') }}"
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    flux_repository: traffic-lab
+    flux_branch: main
+    flux_path: clusters/homelab
+    kubeconfig_path: /etc/rancher/k3s/k3s.yaml
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    # ============ 1. Comprobaciones de credenciales ==================
+    - name: Verificar que GITHUB_USER y GITHUB_TOKEN están exportados
+      ansible.builtin.assert:
+        that:
+          - github_owner | length > 0
+          - github_token | length > 0
+        fail_msg: >-
+          Faltan credenciales. En el nodo de control:
+          export GITHUB_USER=<usuario> && export GITHUB_TOKEN=<token>
+
+    - name: Consultar la identidad real del token en la API de GitHub
+      ansible.builtin.uri:
+        url: https://api.github.com/user
+        headers:
+          Authorization: "token {{ github_token }}"
+      register: gh_identity
+      no_log: true          # evita filtrar el token en la salida
+
+    - name: Verificar que el owner coincide con el dueño del token
+      ansible.builtin.assert:
+        that: (gh_identity.json.login | lower) == (github_owner | lower)
+        fail_msg: >-
+          El owner '{{ github_owner }}' NO coincide con el usuario del token
+          ('{{ gh_identity.json.login }}'). Corrige GITHUB_USER.
+        success_msg: "Token válido: pertenece a '{{ gh_identity.json.login }}'."
+
+    # ============ 2. Instalar el CLI de Flux (idempotente) ===========
+    - name: Comprobar si el CLI de flux ya está
+      ansible.builtin.stat:
+        path: /usr/local/bin/flux
+      register: flux_bin
+
+    - name: Instalar el CLI de Flux
+      ansible.builtin.shell: curl -s https://fluxcd.io/install.sh | bash
+      when: not flux_bin.stat.exists
+      changed_when: true
+
+    # ============ 3. Comprobación previa del clúster =================
+    - name: flux check --pre (acceso al clúster y versiones compatibles)
+      ansible.builtin.command: flux check --pre
+      register: flux_pre
+      changed_when: false
+
+    # ============ 4. Bootstrap (idempotente) =========================
+    - name: Bootstrap de Flux contra el repo de GitHub
+      ansible.builtin.command: >-
+        flux bootstrap github
+        --owner={{ github_owner }}
+        --repository={{ flux_repository }}
+        --branch={{ flux_branch }}
+        --path={{ flux_path }}
+        --personal
+      environment:
+        GITHUB_TOKEN: "{{ github_token }}"
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: flux_boot
+      # heurística: en re-ejecuciones Flux dice "up to date" y no cambia nada
+      changed_when: "'up to date' not in flux_boot.stdout"
+
+    # ============ 5. Comprobaciones posteriores ======================
+    - name: Esperar a que los pods de flux-system estén Ready
+      ansible.builtin.command: >-
+        k3s kubectl -n flux-system wait --for=condition=Ready pods --all --timeout=180s
+      changed_when: false
+
+    - name: flux check (salud tras el bootstrap)
+      ansible.builtin.command: flux check
+      register: flux_post
+      changed_when: false
+
+    - name: Estado de las kustomizations
+      ansible.builtin.command: flux get kustomizations
+      register: flux_ks
+      changed_when: false
+
+    - name: Mostrar resumen
+      ansible.builtin.debug:
+        msg: "{{ flux_ks.stdout_lines }}"
